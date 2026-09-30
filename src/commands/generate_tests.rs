@@ -638,6 +638,7 @@ fn sample_generate_args(model_path: PathBuf) -> crate::GenerateArgs {
         },
         lang_bias: mlxcel::lang_bias::LangBiasCliArgs::default(),
         speculative: mlxcel::cli::speculative_args::SpeculativeArgs::default(),
+        prompt_lookup: crate::PromptLookupOptions::default(),
         // Default to None so existing tests stay on
         // the bit-exact baseline load path; tests that need surgery
         // override this field explicitly.

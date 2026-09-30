@@ -444,7 +444,7 @@ fn validate_pipeline_parallel_args(args: &GenerateArgs) -> Result<()> {
     // Single-adapter only; multi-adapter stacking and runtime hot-swap
     // remain out of scope for v1.
     ensure!(
-        args.model.draft_model.is_none(),
+        args.model.draft_model.is_none() && !args.prompt_lookup.prompt_lookup,
         "CLI pipeline parallelism does not support speculative decoding yet"
     );
     ensure!(
@@ -1730,7 +1730,17 @@ pub(super) fn run_generation_mode(
     // models whose suppressed set is empty.
     token_bias.suppress_tokens(&model.output_suppressed_token_ids());
 
-    let output = if let Some(ref draft_model_path) = args.model.draft_model {
+    let output = if args.prompt_lookup.prompt_lookup {
+        run_prompt_lookup(
+            model,
+            args,
+            prompt_tokens,
+            sampling_config,
+            vlm_embeddings.is_some(),
+            kv_cache_mode,
+            token_bias,
+        )?
+    } else if let Some(ref draft_model_path) = args.model.draft_model {
         // resolve the effective DrafterKind from
         // (a) the explicit `--draft-kind` CLI flag, OR
         // (b) the drafter's `config.json::model_type` auto-detection.
@@ -1960,6 +1970,65 @@ pub(super) fn run_generation_mode(
     };
 
     Ok(output)
+}
+
+/// Offline prompt-lookup speculative decoding (`--prompt-lookup`).
+///
+/// Refuses the model families whose state cannot be rewound after a rejected
+/// block, and multimodal prompts, whose embeddings the generator cannot take.
+/// Runs one short warmup generation first, as `generate_standard` does, so the
+/// timed run does not pay for kernel compilation. The warmup decodes a few
+/// rounds rather than one token so the verify widths get compiled too.
+///
+/// The returned stats time the whole call, prefill included, exactly as
+/// `generate_standard` does, so the printed tok/s compares like for like.
+fn run_prompt_lookup(
+    model: &mlxcel::LoadedModel,
+    args: &GenerateArgs,
+    prompt_tokens: &[i32],
+    sampling_config: &SamplingConfig,
+    has_multimodal_input: bool,
+    kv_cache_mode: KVCacheMode,
+    token_bias: TokenBiasMap,
+) -> Result<(Vec<i32>, GenerationStats)> {
+    ensure!(
+        !has_multimodal_input,
+        "--prompt-lookup supports text-only prompts; drop --image/--audio/--video"
+    );
+    if let Some(reason) = mlxcel::prompt_lookup_unsupported_reason(model) {
+        anyhow::bail!("--prompt-lookup cannot run on this model: {reason}");
+    }
+    let config = args.prompt_lookup.config();
+    config
+        .validate()
+        .map_err(|err| anyhow!("--prompt-lookup: {err}"))?;
+
+    let mut generator = mlxcel::PromptLookupGenerator::new(config)
+        .with_kv_cache_mode(kv_cache_mode)
+        .with_token_bias(token_bias);
+    let warmup_tokens = args.generation.max_tokens.min(16);
+    let _ = generator.generate(model, prompt_tokens, warmup_tokens, sampling_config);
+    let start_time = Instant::now();
+    let (tokens, measured) = generator.generate(
+        model,
+        prompt_tokens,
+        args.generation.max_tokens,
+        sampling_config,
+    );
+    let total_time = start_time.elapsed();
+    // Diagnostics go to stderr on their own line: stdout still holds the
+    // echoed prompt without a trailing newline, and the reply follows it.
+    eprintln!();
+    eprintln!("{}", generator.stats().summary_line(tokens.len()));
+    // `--profile` prints the prefill / decode split the generator measured,
+    // as the plain path does; otherwise the one-line rate covers the whole
+    // call, prefill included, like `generate_standard`.
+    let stats = if args.generation.profile {
+        measured
+    } else {
+        generation_stats_from_duration(prompt_tokens.len(), tokens.len(), total_time)
+    };
+    Ok((tokens, stats))
 }
 
 /// Routing gate for the offline MTP speculative path (issue #166).
@@ -2558,6 +2627,10 @@ pub(crate) fn run_generate(mut args: GenerateArgs) -> Result<()> {
         if args.generation.layout_detections.is_some() {
             args.generation.prompt = Some(String::new());
         } else {
+            ensure!(
+                !args.prompt_lookup.prompt_lookup,
+                "--prompt-lookup requires a one-shot -p/--prompt run (not interactive chat)"
+            );
             let opts = chat_options_from_args(&args)?;
             return crate::commands::run_chat(opts);
         }

@@ -57,8 +57,12 @@
 //!   `trim_caches`). See [`mtp::MtpGenerator`].
 //! - [`stochastic_accept`] — the distribution-preserving acceptance rule and
 //!   its residual resample, shared by every speculative verify path.
+//! - [`prompt_lookup`] — drafter-free speculation that proposes the tokens
+//!   following an earlier occurrence of the sequence's tail. See
+//!   [`prompt_lookup::PromptLookupGenerator`].
 
 pub mod mtp;
+pub mod prompt_lookup;
 pub mod stochastic_accept;
 
 use crate::cache::can_trim_prompt_cache;

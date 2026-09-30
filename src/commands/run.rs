@@ -143,6 +143,7 @@ impl RunArgs {
             tensor_parallel: crate::TensorParallelOptions::default(),
             lang_bias: mlxcel::lang_bias::LangBiasCliArgs::default(),
             speculative: mlxcel::cli::speculative_args::SpeculativeArgs::default(),
+            prompt_lookup: crate::PromptLookupOptions::default(),
             #[cfg(feature = "surgery")]
             surgery: None,
         }

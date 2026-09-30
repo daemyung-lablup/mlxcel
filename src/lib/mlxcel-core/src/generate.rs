@@ -338,6 +338,69 @@ fn chunked_prefill_last_logits<M: LanguageModel + ?Sized>(
     logits.expect("chunked_prefill_last_logits requires a non-empty prompt")
 }
 
+/// Prefill the whole prompt and return the `[1, 1, vocab]` logits of its last
+/// position, the way [`CxxGenerator::generate_streaming`] does.
+///
+/// Picks cache-level chunked prefill when `MLXCEL_PREFILL_CHUNK` applies,
+/// tile-aligned padded prefill on M5+ hardware, and one `forward_last_logits`
+/// over the prompt otherwise. Speculative generators that must stay
+/// byte-identical to plain decoding at greedy sampling call this instead of
+/// their own prefill: splitting the prompt differently changes the fp16
+/// rounding of the cached keys and values, and with it the first token.
+///
+/// Used by: `CxxGenerator::generate_streaming`, `PromptLookupGenerator`
+pub(crate) fn prefill_prompt_last_logits<M: LanguageModel>(
+    model: &M,
+    caches: &mut [KVCache],
+    prompt_tokens: &[i32],
+) -> UniquePtr<MlxArray> {
+    let actual_len = prompt_tokens.len();
+    let prefill_chunk = effective_prefill_chunk(
+        prefill_chunk_len(),
+        model.supports_chunked_prefill(),
+        actual_len,
+    );
+    if let Some(chunk) = prefill_chunk {
+        // Cache-level chunked prefill (MLXCEL_PREFILL_CHUNK, default 2048).
+        chunked_prefill_last_logits(model, caches, prompt_tokens, chunk)
+    } else if should_align_prefill() && model.supports_padded_prefill() {
+        let padded_len = align_to_na_tile(actual_len);
+        let (padded_tokens, mask_opt) = pad_tokens_for_prefill(
+            prompt_tokens,
+            padded_len,
+            model.supports_maskless_padded_prefill(),
+        );
+        let input = ffi::from_slice_i32(&padded_tokens, &[1, padded_len as i32]);
+        // Last *real* token position; `forward_last_logits` slices there,
+        // replacing the previous forward + `logits_at_position` pair.
+        let raw_logits = model.forward_last_logits(
+            &input,
+            caches,
+            mask_opt.as_ref().map(|m| m.as_ref().unwrap()),
+            actual_len.saturating_sub(1),
+        );
+        // Trim padding positions from all KV caches so decode uses the
+        // correct cache offset (actual_len, not padded_len).
+        if padded_len > actual_len {
+            trim_caches_to_actual_len(caches, actual_len, padded_len);
+            model.trim_internal_caches((padded_len - actual_len) as i32);
+        }
+        raw_logits
+    } else {
+        let input = ffi::from_slice_i32(prompt_tokens, &[1, actual_len as i32]);
+        model.forward_last_logits(&input, caches, None, actual_len.saturating_sub(1))
+    }
+}
+
+/// Per-layer KV cache modes for `n_layers` caches under the nominal `mode`,
+/// with the Boundary-V upgrade (`MLXCEL_KV_BOUNDARY_V_LAYERS`) applied.
+///
+/// Used by: `CxxGenerator`, `PromptLookupGenerator`
+pub(crate) fn resolve_kv_cache_layer_modes(mode: KVCacheMode, n_layers: usize) -> Vec<KVCacheMode> {
+    let requested = crate::cache::turbo::boundary_v_layers_from_env();
+    crate::cache::turbo::resolve_layer_modes(mode, n_layers, requested)
+}
+
 /// Trait for language models that can be used for generation
 pub trait LanguageModel {
     /// Forward pass through the model
@@ -1657,9 +1720,7 @@ impl CxxGenerator {
     /// including `reset_with_model` boundary cases.
     ///
     fn resolved_layer_modes_for(&self, n_layers: usize) -> Vec<KVCacheMode> {
-        let nominal = self.kv_cache_mode;
-        let requested = crate::cache::turbo::boundary_v_layers_from_env();
-        crate::cache::turbo::resolve_layer_modes(nominal, n_layers, requested)
+        resolve_kv_cache_layer_modes(self.kv_cache_mode, n_layers)
     }
 
     fn apply_kv_cache_mode_with_boundary_policy(&mut self) -> Vec<KVCacheMode> {
@@ -1751,42 +1812,7 @@ impl CxxGenerator {
         // Prefill: process all prompt tokens at once.
         // On M5+ hardware pad the sequence to a 32-token tile boundary for
         // optimal Neural Accelerator throughput.
-        let actual_len = prompt_tokens.len();
-        let prefill_chunk = effective_prefill_chunk(
-            prefill_chunk_len(),
-            model.supports_chunked_prefill(),
-            actual_len,
-        );
-        let logits = if let Some(chunk) = prefill_chunk {
-            // Cache-level chunked prefill (MLXCEL_PREFILL_CHUNK, default 2048).
-            chunked_prefill_last_logits(model, &mut self.caches, prompt_tokens, chunk)
-        } else if should_align_prefill() && model.supports_padded_prefill() {
-            let padded_len = align_to_na_tile(actual_len);
-            let (padded_tokens, mask_opt) = pad_tokens_for_prefill(
-                prompt_tokens,
-                padded_len,
-                model.supports_maskless_padded_prefill(),
-            );
-            let input = ffi::from_slice_i32(&padded_tokens, &[1, padded_len as i32]);
-            // Last *real* token position; `forward_last_logits` slices there,
-            // replacing the previous forward + `logits_at_position` pair.
-            let raw_logits = model.forward_last_logits(
-                &input,
-                &mut self.caches,
-                mask_opt.as_ref().map(|m| m.as_ref().unwrap()),
-                actual_len.saturating_sub(1),
-            );
-            // Trim padding positions from all KV caches so decode uses the
-            // correct cache offset (actual_len, not padded_len).
-            if padded_len > actual_len {
-                trim_caches_to_actual_len(&mut self.caches, actual_len, padded_len);
-                model.trim_internal_caches((padded_len - actual_len) as i32);
-            }
-            raw_logits
-        } else {
-            let input = ffi::from_slice_i32(prompt_tokens, &[1, actual_len as i32]);
-            model.forward_last_logits(&input, &mut self.caches, None, actual_len.saturating_sub(1))
-        };
+        let logits = prefill_prompt_last_logits(model, &mut self.caches, prompt_tokens);
 
         if trace_dtype {
             ffi::eval(&logits);

@@ -370,6 +370,61 @@ pub(crate) struct RmArgs {
     pub(crate) revision: Option<String>,
 }
 
+/// Prompt-lookup (n-gram) speculative decoding options
+#[derive(Args, Debug, Clone)]
+#[command(next_help_heading = "Prompt Lookup Options")]
+pub(crate) struct PromptLookupOptions {
+    /// Speculate with prompt lookup: propose the tokens that followed an
+    /// earlier occurrence of the sequence's last few tokens, and verify them
+    /// in one target forward. No draft model is needed. Pays off on replies
+    /// that copy the prompt (edits, rewrites, reformatting); on other replies
+    /// proposals are shortened or paused so decoding stays near plain speed.
+    /// Text-only, attention-cache models.
+    #[arg(long, conflicts_with = "draft_model")]
+    pub(crate) prompt_lookup: bool,
+
+    /// Longest suffix n-gram matched against the context
+    #[arg(long, default_value_t = mlxcel::PromptLookupConfig::default().ngram_max, value_name = "N")]
+    pub(crate) prompt_lookup_ngram_max: usize,
+
+    /// Shortest suffix n-gram matched against the context
+    #[arg(long, default_value_t = mlxcel::PromptLookupConfig::default().ngram_min, value_name = "N")]
+    pub(crate) prompt_lookup_ngram_min: usize,
+
+    /// Maximum tokens proposed per round (the verify block is one wider)
+    #[arg(long, default_value_t = mlxcel::PromptLookupConfig::default().max_draft, value_name = "N")]
+    pub(crate) prompt_lookup_max_draft: usize,
+
+    /// Propose up to the maximum every round, instead of shortening or pausing
+    /// proposals while they stop landing (for A/B measurement)
+    #[arg(long)]
+    pub(crate) prompt_lookup_no_adaptive: bool,
+}
+
+impl Default for PromptLookupOptions {
+    fn default() -> Self {
+        let config = mlxcel::PromptLookupConfig::default();
+        Self {
+            prompt_lookup: false,
+            prompt_lookup_ngram_max: config.ngram_max,
+            prompt_lookup_ngram_min: config.ngram_min,
+            prompt_lookup_max_draft: config.max_draft,
+            prompt_lookup_no_adaptive: !config.adaptive,
+        }
+    }
+}
+
+impl PromptLookupOptions {
+    pub(crate) fn config(&self) -> mlxcel::PromptLookupConfig {
+        mlxcel::PromptLookupConfig {
+            ngram_max: self.prompt_lookup_ngram_max,
+            ngram_min: self.prompt_lookup_ngram_min,
+            max_draft: self.prompt_lookup_max_draft,
+            adaptive: !self.prompt_lookup_no_adaptive,
+        }
+    }
+}
+
 #[derive(Args, Debug)]
 pub(crate) struct GenerateArgs {
     #[command(flatten)]
@@ -397,6 +452,9 @@ pub(crate) struct GenerateArgs {
     /// [`SpeculativeArgs`] for the rationale.
     #[command(flatten)]
     pub(crate) speculative: SpeculativeArgs,
+
+    #[command(flatten)]
+    pub(crate) prompt_lookup: PromptLookupOptions,
 
     // Axis A weight-load surgery configuration.
     // The closed-repo references stay in this non-doc comment so the

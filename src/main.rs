@@ -3157,6 +3157,7 @@ const FAMILY_ORDER: &[&str] = &[
     "BitNet",
     "Speech-to-text",
     "Text-to-speech",
+    "Speech",
     "Embedding",
     "Reranker",
     "Diffusion",

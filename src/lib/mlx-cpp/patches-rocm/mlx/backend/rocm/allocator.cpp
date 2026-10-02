@@ -25,6 +25,10 @@
 #include <string>
 #include <vector>
 
+// OpenBLAS's thread-count setter, weak so a build linked against another BLAS
+// still links (the pointer is then null and nothing changes).
+extern "C" void openblas_set_num_threads(int) __attribute__((weak));
+
 namespace mlx::core {
 
 namespace rocm {
@@ -123,6 +127,25 @@ static void ensure_mlx_device_current() {
   }
 }
 
+// The CPU stream's BLAS and LAPACK calls write their results straight into
+// buffers from this allocator. Multithreaded OpenBLAS (0.3.29, 32 threads on
+// the gfx1151 host) returns wrong columns when its output is fine-grained
+// device memory: a standalone cblas_sgemm of [1, 2880] x [2880, 2880]^T was
+// wrong in 37 of 50 calls with inputs and output in fine-grained memory and in
+// 10 of 300 with only the output there, and exact in every call with one
+// thread or with a malloc'd output (lablup/mlxcel#2072). One BLAS thread keeps
+// the CPU stream correct; GPU work is unaffected. Runs once, on the first
+// fine-grained allocation, which precedes any CPU-stream BLAS call writing
+// such a buffer.
+inline void single_thread_cpu_blas_for_finegrained() {
+  static std::once_flag once;
+  std::call_once(once, [] {
+    if (openblas_set_num_threads != nullptr) {
+      openblas_set_num_threads(1);
+    }
+  });
+}
+
 // CUDA unified_malloc: managed if supported else host pinned.
 // ROCm discrete training: prefer real VRAM (hipMalloc) so we never spill GTT.
 // APU: fine-grained coherent. Managed only as explicit fallback.
@@ -137,6 +160,7 @@ inline void* unified_malloc(size_t size, bool& is_managed) {
   if (use_finegrained()) {
     err = hipExtMallocWithFlags(&data, size, hipDeviceMallocFinegrained);
     if (err == hipSuccess) {
+      single_thread_cpu_blas_for_finegrained();
       is_managed = true;
       return data;
     }
@@ -400,6 +424,14 @@ static void free_rocm_buffer_cb(RocmBuffer* buf) {
   allocator().free_rocm_buffer(buf);
 }
 
+namespace {
+thread_local size_t t_allocated_bytes = 0;
+} // namespace
+
+size_t thread_allocated_bytes() {
+  return t_allocated_bytes;
+}
+
 // CUDA: Buffer malloc(size) { return malloc_async(size, -1, nullptr); }
 Buffer RocmAllocator::malloc(size_t size) {
   if (!rocm_available()) {
@@ -410,6 +442,7 @@ Buffer RocmAllocator::malloc(size_t size) {
   if (decode_arena_.active && size > 0) {
     std::lock_guard lock(mutex_);
     if (RocmBuffer* b = arena_alloc(size)) {
+      t_allocated_bytes += size;
       return Buffer{b};
     }
   }
@@ -421,6 +454,7 @@ Buffer RocmAllocator::malloc_async(size_t size, int device, void* stream_v) {
   if (decode_arena_.active && size > 0) {
     std::lock_guard lock(mutex_);
     if (RocmBuffer* b = arena_alloc(size)) {
+      t_allocated_bytes += size;
       return Buffer{b};
     }
   }
@@ -461,6 +495,22 @@ Buffer RocmAllocator::malloc_async(size_t size, int device, void* stream_v) {
   std::unique_lock lock(mutex_);
   RocmBuffer* buf = buffer_cache_.reuse_from_cache(size);
   if (!buf) {
+    // Honour set_cache_limit() on a miss (lablup/mlxcel#2062). The cache is
+    // exact-size (min_utilization 1.0), so buffers of sizes no longer asked
+    // for stay in it until clear_cache(); before this trim the limit was
+    // stored and never read, so MLX's set_cache_limit (MLXCEL_CACHE_LIMIT)
+    // bounded nothing on ROCm. Only a miss trims: a miss is about to grow
+    // active + cache anyway and already pays for a HIP allocation, while
+    // free() and cache hits stay free of hipFree (see free() for why). The
+    // footprint only grows on a miss, so active + cache stays within the
+    // live set plus max_pool_size_ plus the one request being served. Trim
+    // to three quarters of the limit, not to the limit itself: every
+    // release is a blocking hipFree, and the slack lets one trim cover the
+    // next several misses of a workload whose shapes keep changing.
+    if (get_cache_memory() > max_pool_size_) {
+      buffer_cache_.release_cached_buffers(
+          get_cache_memory() - max_pool_size_ / 4 * 3);
+    }
     // Scalar pool first (CUDA).
     if (size <= static_cast<size_t>(small_block_size)) {
       buf = scalar_pool_.malloc();
@@ -564,8 +614,10 @@ Buffer RocmAllocator::malloc_async(size_t size, int device, void* stream_v) {
 
   active_memory_ += buf->size;
   peak_memory_ = std::max(active_memory_, peak_memory_);
-  // No eager max_pool_size_ trim here — that was the free/alloc storm.
-  // clear_cache() / set_cache_limit() still shrink explicitly.
+  t_allocated_bytes += buf->size;
+  // No eager max_pool_size_ trim on every call: that was the free/alloc
+  // storm. The miss path above trims to max_pool_size_; clear_cache() still
+  // empties the cache.
   return Buffer{buf};
 }
 
@@ -687,8 +739,8 @@ void RocmAllocator::free(Buffer buffer, bool force) {
   // 100% hipFree. CUDA frees immediately when cache >= max_pool_size_; on
   // ROCm that is catastrophic — the bwd→Adam transition drops tens of GB of
   // same-sized activations that the *next* step needs, and hipFree is a
-  // blocking drain. Bound HBM only from malloc_async (memory_limit_ pressure
-  // + max_pool_size_ trim there), where a miss already has to wait.
+  // blocking drain. Bound HBM only from malloc_async (the hbm_cap reclaim
+  // and the max_pool_size_ trim on a miss), where a miss already has to wait.
   buffer_cache_.recycle_to_cache(buf);
 }
 

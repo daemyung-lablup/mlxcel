@@ -563,6 +563,22 @@ mod ffi {
             reduce: i32,
         ) -> Result<UniquePtr<MlxArray>>;
 
+        /// Dynamic-start slice update: `src` with `update` written at the
+        /// offsets held in the int array `start`, one per entry of `axes`
+        /// (MLX's `slice_update(src, update, start, axes)`, which builds the
+        /// `DynamicSliceUpdate` primitive). Each offset is clamped to where
+        /// the update fits, since the GPU writes at it unchecked; an axis out
+        /// of range or a `start` length other than `axes.len()` is an `Err`.
+        /// Test-only entry point: no model
+        /// path uses it; `tests/rocm_slice_update_source.rs` drives the ROCm
+        /// `DynamicSliceUpdate::eval_gpu` through it.
+        fn slice_update_dynamic(
+            src: &MlxArray,
+            update: &MlxArray,
+            start: &MlxArray,
+            axes: &[i32],
+        ) -> Result<UniquePtr<MlxArray>>;
+
         /// Argmax along axis
         fn argmax(a: &MlxArray, axis: i32, keepdims: bool) -> UniquePtr<MlxArray>;
 
@@ -1414,8 +1430,9 @@ mod ffi {
         /// Returns `Err` instead of ending the process when the GPU backend has
         /// no custom kernel port (issue #1803): the C++ launcher throws and cxx
         /// turns that into an `Err` here, which a `noexcept` extern could not
-        /// do. mlxcel's own callers gate on `custom_kernels_available()` and
-        /// never reach it.
+        /// do. mlxcel's own callers gate on
+        /// [`paged_attention_decode_available`] (or the all-kernels
+        /// [`paged_attention_kernels_available`]) and never reach it.
         fn paged_attention_decode(
             q: &MlxArray,
             k_pool: &MlxArray,
@@ -1477,8 +1494,8 @@ mod ffi {
         /// Returns `Err` instead of ending the process when the GPU backend has
         /// no custom kernel port (issue #1803): the C++ launcher throws and cxx
         /// turns that into an `Err` here, which a `noexcept` extern could not
-        /// do. mlxcel's own callers gate on `custom_kernels_available()` and
-        /// never reach it.
+        /// do. mlxcel's own callers gate on [`paged_attention_merge_available`]
+        /// or [`paged_attention_kernels_available`] and never reach it.
         fn paged_attention_merge_states(
             v_in: &MlxArray,
             lse_in: &MlxArray,
@@ -1486,6 +1503,32 @@ mod ffi {
             v_out: &mut UniquePtr<MlxArray>,
             lse_out: &mut UniquePtr<MlxArray>,
         ) -> Result<()>;
+
+        /// True when the resolved GPU backend has ports of all three
+        /// paged-attention kernels: the v1 decode kernel, the v2 partial kernel
+        /// and the merge kernel. Answered from the kernels' own `KernelPorts`
+        /// tables (`has_kernel_port`), the ones their launchers dispatch
+        /// through, so this cannot say yes to a launch that would refuse.
+        /// Metal and CUDA today; ROCm answers `false` until lablup/mlxcel#1814
+        /// ports them.
+        fn paged_attention_kernels_available() -> bool;
+
+        /// True when the resolved GPU backend has a port of the merge kernel
+        /// ([`paged_attention_merge_states`]), which MLA split-KV uses on its
+        /// own. Same source of truth as [`paged_attention_kernels_available`].
+        fn paged_attention_merge_available() -> bool;
+
+        /// True when the resolved GPU backend has a port of the v1 paged
+        /// decode kernel ([`paged_attention_decode`]). Same source of truth as
+        /// [`paged_attention_kernels_available`].
+        fn paged_attention_decode_available() -> bool;
+
+        /// True when the resolved GPU backend has ports of both v2 kernels,
+        /// the partial kernel ([`paged_attention_decode_v2_partial`]) and the
+        /// merge kernel, which the flat, cascade and sparse v2 launches use
+        /// together. Same source of truth as
+        /// [`paged_attention_kernels_available`].
+        fn paged_attention_v2_available() -> bool;
 
         /// Query heads one v2 CTA processes together (issue #898). Always
         /// divides `n_rep`, so the plan's CTA count and the launcher's grid
@@ -1818,14 +1861,29 @@ mod ffi {
             next_state: &mut UniquePtr<MlxArray>,
         ) -> Result<()>;
 
-        /// Whether the fused Mamba1 selective-scan kernel can run (Metal only;
-        /// `MLXCEL_MAMBA1_SCAN_KERNEL=0` forces the graph scan).
+        /// Whether the fused Mamba1 selective-scan kernel can run (Metal and
+        /// CUDA; `MLXCEL_MAMBA1_SCAN_KERNEL=0` forces the graph scan).
         fn mamba1_scan_kernel_available() -> bool;
 
-        /// Mamba1 selective scan fused over the sequence (issue #2005).
+        /// Whether the fused scan can serve these inputs: it is available, the
+        /// default device is the GPU, `N <= 32`, and on CUDA all six inputs
+        /// share one floating dtype (the condition under which the CUDA kernel
+        /// is bit-identical to the graph scan, issue #1981). Callers take the
+        /// graph scan when this is false.
+        fn mamba1_scan_kernel_accepts(
+            x: &MlxArray,
+            delta: &MlxArray,
+            b: &MlxArray,
+            c: &MlxArray,
+            a: &MlxArray,
+            d: &MlxArray,
+        ) -> bool;
+
+        /// Mamba1 selective scan fused over the sequence (issues #2005, #1981).
         /// x, delta `[B, L, D]`, b, c `[B, L, N]`, a `[D, N]` (= -exp(A_log)),
         /// d `[D]`, state_in `[B, D, N]`. Writes y `[B, L, D]` in x's dtype and
-        /// the final state `[B, D, N]` in float32.
+        /// the final state `[B, D, N]`: float32 on Metal, x's dtype on CUDA,
+        /// where every step rounds like the graph scan.
         /// Used by: Jamba, Mamba, Falcon-Mamba
         #[allow(clippy::too_many_arguments)]
         fn mamba1_selective_scan(
@@ -2285,6 +2343,22 @@ mod ffi {
         /// *this* kernel" stopped being the same question the moment ROCm got
         /// its first port.
         fn bitlinear_kernel_available() -> bool;
+
+        /// Whether `quantized_matmul` for this transposed affine projection
+        /// runs the same dense GEMM as `dequantize` + `matmul`, so the two
+        /// return the same bytes (lablup/mlxcel#2081). Reads the
+        /// QuantizedMatmul route on ROCm; true on every other backend, whose
+        /// rule is the output-tile count in
+        /// [`crate::layers::prefill_dense_gemm_eligible`]. `biases` may be
+        /// null.
+        unsafe fn quantized_matmul_matches_dense_gemm(
+            x: &MlxArray,
+            weight: &MlxArray,
+            scales: &MlxArray,
+            biases: *const MlxArray,
+            group_size: i32,
+            bits: i32,
+        ) -> bool;
 
         /// True when this backend has a fused affine 1-bit kernel port
         /// (Metal). Other backends run 1-bit weights through the dequantize

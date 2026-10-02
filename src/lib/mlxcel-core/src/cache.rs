@@ -78,6 +78,9 @@
 pub mod batch_quant;
 mod detach;
 mod paged;
+#[cfg(test)]
+#[path = "cache/paged_append_need_tests.rs"]
+mod paged_append_need_tests;
 /// Whole-batch decode over pool-backed KV caches, the production paged decode
 /// path (issue #899).
 pub mod paged_batch_decode;
@@ -7016,6 +7019,20 @@ impl CachePool {
             .and_then(|pool| pool.borrow().free_block_budget())
     }
 
+    /// Pool blocks appending `token_count` tokens to every layer of sequence
+    /// `id` would acquire (see [`PagedBlockPool::blocks_to_append`]). `0` for a
+    /// dense or model-owned sequence, an unknown id, or when no paged pool
+    /// exists. The scheduler uses it to reserve decode budget (issue #1982).
+    pub fn paged_blocks_to_append(&self, id: SequenceId, token_count: usize) -> usize {
+        let Some(pool) = self.paged_pool.as_ref() else {
+            return 0;
+        };
+        let Some(state) = self.active.get(&id).and_then(|seq| seq.paged.as_ref()) else {
+            return 0;
+        };
+        pool.borrow().blocks_to_append(&state.borrow(), token_count)
+    }
+
     /// Read-only access to the underlying [`PagedBlockPool`].
     ///
     /// Returns a [`Ref`] guard; release it before any path that mutates the
@@ -7747,6 +7764,44 @@ mod tests {
         let (k, _) = c.update_and_fetch(row(5.0), row(50.0));
         assert_eq!(f32_rows(&k), vec![5.0, 2.0, 3.0, 4.0]);
         assert_eq!(f32_rows(&full_k), full_before, "wrapped overwrite copied");
+    }
+
+    /// A prompt-cache snapshot taken in steady state keeps its rows when the
+    /// next token overwrites a ring slot (#2052). The snapshot is what
+    /// `ModelStateSnapshot::push_tensor` captures: a lazy copy of the live
+    /// keys array, not yet evaluated when the next write runs. A backend
+    /// that donates the keys buffer to that write while the copy still
+    /// references the array (ROCm before #2052) writes the new token into
+    /// the snapshot.
+    #[test]
+    fn rotating_steady_state_snapshot_survives_the_next_wrap_write() {
+        if !ffi::default_device_is_gpu() {
+            return;
+        }
+        let mut c = RotatingKVCache::new(4);
+        // Token 5 is the first steady-state write; it leaves the keys in a
+        // buffer nothing else shares.
+        for t in 1..=5 {
+            let (k, _) = c.update_and_fetch(row(t as f32), row(10.0 * t as f32));
+            ffi::eval(&k);
+        }
+        let mut snap = crate::generate::ModelStateSnapshot::new("test", 5);
+        snap.push_tensor("k", c.keys.as_ref().unwrap());
+        snap.push_tensor("v", c.values.as_ref().unwrap());
+        // Token 6 overwrites slot 1 (token 2), which the snapshot still holds.
+        let (k, v) = c.update_and_fetch(row(6.0), row(60.0));
+        assert_eq!(f32_rows(&k), vec![5.0, 6.0, 3.0, 4.0]);
+        assert_eq!(f32_rows(&v), vec![50.0, 60.0, 30.0, 40.0]);
+        assert_eq!(
+            f32_rows(snap.tensor("k").unwrap()),
+            vec![5.0, 2.0, 3.0, 4.0],
+            "snapshot keys kept token 2"
+        );
+        assert_eq!(
+            f32_rows(snap.tensor("v").unwrap()),
+            vec![50.0, 20.0, 30.0, 40.0],
+            "snapshot values kept token 2"
+        );
     }
 
     /// The `MLXCEL_DIAG_SKIP_DECODE_KV_WRITE` path returns exactly the live

@@ -420,6 +420,34 @@ make release-rocm
 naming the conflict. The first build compiles the MLX device code with `hipcc`,
 which takes a few minutes on top of the Rust build.
 
+Incremental builds track headers: `hipcc` writes a dependency file next to
+each HIP object, so after you change a header under
+`src/lib/mlx-cpp/patches-rocm/`, the next build recompiles exactly the `.hip`
+files that include it, directly or transitively, and a build with no change
+recompiles none. The overlay reaches the build tree through CMake's
+`configure_file`, which rewrites a copy only when its content differs, so a
+bare `touch` of an overlay header rebuilds nothing; its content has to change.
+The dependency files also list ROCm and system headers, so updating those
+rebuilds every HIP object on its own. They do not list headers that only the
+device compilation includes (today only rocWMMA's), nor the compiler itself.
+
+To force a clean HIP rebuild anyway (for example after upgrading `hipcc` or
+rocWMMA, or to rule out a stale object while bisecting), delete the HIP objects
+of the build profile you use and touch any overlay file so that Cargo reruns
+the build script:
+
+```bash
+rm -rf target/release/build/mlxcel-core-*/out/build/_deps/mlx-build/mlx/backend/rocm/hip_objs
+touch src/lib/mlx-cpp/patches-rocm/mlx/backend/rocm/CMakeLists.txt
+cargo build --release --features rocm
+```
+
+Replace `release` with the profile directory you build (`debug`, `test-fast`,
+and so on). Without the `touch`, Cargo sees no changed input, skips the build
+script and keeps linking the old kernels. `cargo clean -p mlxcel-core
+--release` (or `--profile <name>`) also forces it, but rebuilds the whole MLX
+C++ library too.
+
 ### HIP architecture selection
 
 The build compiles MLX device code for the `gfx` targets that `rocminfo`
@@ -457,6 +485,9 @@ To check the HTTP server rather than the CLI, start it and run the chat smoke
 script against it. Both a dense and an affine MoE checkpoint pass on `gfx1151`;
 the results are in
 [`docs/benchmark_results/rocm-correctness-gfx1151-2026-09-12.md`](benchmark_results/rocm-correctness-gfx1151-2026-09-12.md).
+A sliding-window model, two SSM hybrids and a VLM were added, and compared
+against an Apple M5 Max Metal reference, in
+[`docs/benchmark_results/rocm-correctness-gfx1151-2026-09-30.md`](benchmark_results/rocm-correctness-gfx1151-2026-09-30.md).
 
 ```bash
 ./target/release/mlxcel-server -m models/mlx/Qwen3-30B-A3B-4bit --port 8080 &
@@ -473,21 +504,61 @@ in
 [`docs/benchmark_results/rocm-baseline-gfx1151-2026-09-30.md`](benchmark_results/rocm-baseline-gfx1151-2026-09-30.md);
 `scripts/bench_decode.sh` recognises a ROCm host on its own (see
 [Benchmarks](benchmarks.md#rocm-hosts-issue-1810)).
+Where that decode time goes, per kernel, and the order the #1814 kernel ports
+should land in, is in
+[`docs/benchmark_results/rocm-decode-profile-gfx1151-2026-09-30.md`](benchmark_results/rocm-decode-profile-gfx1151-2026-09-30.md).
+
+#### Memory footprint
+
+Two defaults keep the allocator's footprint close to the weights
+(lablup/mlxcel#2062). Measured on `gfx1151` at pp512/tg128, the MLX peak for
+Meta-Llama-3.1-8B-Instruct-4bit went from 20.60 GB to 6.14 GB and for
+Qwen3-30B-A3B-4bit from 23.56 GB to 18.58 GB, with decode throughput
+unchanged and prefill within 2%; the breakdown and every knob compared are in
+[`docs/benchmark_results/rocm-memory-gfx1151-2026-09-30.md`](benchmark_results/rocm-memory-gfx1151-2026-09-30.md).
+
+- **In-flight bound, `MLX_ROCM_MAX_INFLIGHT_MB` (default 1024).** Most of
+  the old peak was not cache: a prefill allocates a transient for every
+  operation (for an f16 4-bit model on the dequantize-and-GEMM path, an f16
+  copy of each weight matrix), each one is released only when its command batch
+  finishes on the GPU, and the host could encode far ahead of the GPU. The
+  backend now commits a batch once it has allocated a quarter of this budget
+  and waits for the oldest batch while more than the budget is in flight, so
+  the transients stay within roughly this many MiB (the count is of
+  allocations, so it is approximate). `0` restores the unbounded behavior.
+- **Buffer-cache bound, `MLXCEL_CACHE_LIMIT` (default 2 GiB on ROCm).** Freed
+  buffers are cached for reuse, and the ROCm allocator only reuses a buffer of
+  exactly the requested size, with a cache limit that defaulted to its memory
+  limit (76.8 GiB here). A ROCm build now caps the cache at 2 GiB unless
+  `MLXCEL_CACHE_LIMIT` says otherwise; `0` or `none` removes the cap. Before
+  this change the allocator ignored the cache limit altogether, so
+  `MLXCEL_CACHE_LIMIT` had no effect on ROCm. Decode throughput did not move
+  between 128 MiB and no cap on either model; prefill lost 16% on the 8B at
+  128 MiB, because each f16 weight copy is reallocated once the cache cannot
+  hold it, and nothing measurable from 512 MiB up. 2 GiB is four times that
+  smallest free value, which leaves room for the larger weight copies of
+  bigger models.
+
+The allocator's peak counts live buffers only, so the most the allocator
+holds is the peak plus the cache limit. The memory limit the pre-load
+estimate reads (`memory_limit()`, 76.80 GiB) is unchanged by either default,
+so `mlxcel inspect` and `--estimate-memory` give the same answers as before.
 
 ### Current status
 
 | Area | Status on ROCm |
 |------|----------------|
 | Affine 4-bit / 8-bit checkpoints | Run natively. |
-| mxfp8 and mxfp4 checkpoints | Run natively, including MoE experts through `gather_qmm` (for example gpt-oss-20b-MXFP4-Q4). The load log says so once per mode (`Quantization mode mxfp4: running on native ROCm kernels, no load-time conversion ...`). mxfp4 `quantize`, `quantized_matmul` and `gather_qmm` are checked against CPU references by `tests/rocm_mxfp4_quant.rs` (lablup/mlxcel#1808). |
+| mxfp8 and mxfp4 checkpoints | Run natively, including MoE experts through `gather_qmm` (for example gpt-oss-20b-MXFP4-Q4). The load log says so once per mode (`Quantization mode mxfp4: running on native ROCm kernels, no load-time conversion ...`). mxfp4 `quantize`, `quantized_matmul` and `gather_qmm` are checked against CPU references by `tests/rocm_mxfp4_quant.rs` (lablup/mlxcel#1808). Vendor FP8 block checkpoints (`quant_method: fp8`, 128x128 blocks) are requantized to mxfp8 at load and run natively; verified end to end on a dense 0.8B Qwen3.5 FP8 checkpoint, with mxfp8 `gather_qmm` and `quantized_matmul` checked by `models::switch_layers::mxfp_tests`. The official Qwen3.5 FP8 MoE releases have not been run on ROCm (lablup/mlxcel#1807). |
 | NVFP4 checkpoints | No native kernel. ModelOpt NVFP4 checkpoints (for example the Gemma 4 NVFP4 exports) are converted to affine 4-bit at load with no environment variables, and the load log names the route and the reason. A layer that cannot be converted fails the load with its name and the reason. MLX-native NVFP4 exports (`"mode": "nvfp4"` in `config.json`, such as `mlx-community/*-nvfp4`) have no load-time conversion and are refused at load; use an affine export instead (lablup/mlxcel#1806). |
 | Affine MoE models (for example Qwen3-30B-A3B) | Run natively. The fused MoE path used to abort on ROCm; lablup/mlxcel#1803 routes it to the MLX graph fallback, so `MLXCEL_FUSED_MOE=0` is no longer needed. |
 | mlxcel's fused kernels (sampling, fused norm, RoPE + KV append, paged attention) | Run as MLX graph fallbacks on the paths that have one (lablup/mlxcel#1803); ROCm ports are lablup/mlxcel#1814. |
 | GPU faults | Reported as errors (lablup/mlxcel#1804). A launch HIP rejects (an oversized block, no code object for the device) fails the evaluation that issued it and the device stays usable. An asynchronous fault (an out-of-bounds access) fails the evaluation waiting on it within about a second instead of hanging or returning NaN; the server fails that request and answers later ones with the same error, because after a queue fault the HIP runtime rejects every call for the rest of the process, so the process has to restart, and its shutdown may need a SIGKILL (HIP's teardown waits on callbacks the faulted queue never runs). A kernel that never finishes is not detected; `MLX_ROCM_GPU_WATCHDOG_SECS` (default off) fails any single host wait that outlives it. |
 | Memory estimation on UMA hosts | Correct. Measured on the tested configuration: the ROCm allocator reports a nonzero cap (76.80 GiB of the 96 GiB carve-out), which the estimator reads before it would ever reach host RAM, so nothing that fits the carve-out is refused for that reason (lablup/mlxcel#1805). |
 | Diagnostics | Report the AMD vendor, device name, `gfx` target and device memory, and no longer print a CUDA compute capability for it (lablup/mlxcel#1805). A binary whose compiled `gfx` list does not cover the device refuses to start rather than failing at the first kernel launch. |
+| CPU device on a ROCm build (`MLXCEL_DEVICE=cpu`) | Runs, but slowly: on the tested host a Qwen3-0.6B-4bit decode step takes about two minutes, so it is a correctness reference and an escape hatch for a mismatched `gfx` build, not a serving mode. Before lablup/mlxcel#1807 every attention model aborted at the first token with `NYI`. BLAS work on this device (f32 matmul, convolution, linear algebra) runs on one OpenBLAS thread: with OpenBLAS's default thread count it intermittently wrote wrong output columns into the ROCm allocator's fine-grained memory (lablup/mlxcel#2072, `patches-rocm/LOCAL_FIXES.md` item 27). |
 | `mlxcel-server` chat completions | Work for dense and affine MoE checkpoints, streaming and non-streaming; verified with `scripts/server_chat_smoke.sh`. |
-| Audio (speech to text, text to speech) | Works. The FFT primitive runs on hipFFT; plans are cached up to `MLX_ROCM_FFT_CACHE_SIZE` (default 128, as on CUDA; lablup/mlxcel#1825, #1876). |
+| Audio (speech to text, text to speech) | Works. The FFT primitive runs on hipFFT; plans are cached up to `MLX_ROCM_FFT_CACHE_SIZE` (default 128, as on CUDA; lablup/mlxcel#1825, #1876); a value that is not a positive integer is ignored with a warning (#2051). |
 | Windows, multiple GPUs, distributed inference | Not supported. |
 
 Decode throughput measured on the tested configuration, for orientation only

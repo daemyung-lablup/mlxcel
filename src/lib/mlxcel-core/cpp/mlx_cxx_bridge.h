@@ -417,6 +417,14 @@ std::unique_ptr<MlxArray> slice_update_reduce(const MlxArray& src,
                                               rust::Slice<const int32_t> stops,
                                               int32_t reduce);
 
+// Dynamic-start slice update: src with update written at the offsets in the
+// int array start, along axes (the DynamicSliceUpdate primitive). MLX's
+// validation errors surface as a Rust Err. Test-only entry point.
+std::unique_ptr<MlxArray> slice_update_dynamic(const MlxArray& src,
+                                               const MlxArray& update,
+                                               const MlxArray& start,
+                                               rust::Slice<const int32_t> axes);
+
 // Argmax along axis
 std::unique_ptr<MlxArray> argmax(const MlxArray& a, int32_t axis, bool keepdims);
 
@@ -1412,6 +1420,22 @@ std::unique_ptr<MlxArray> rocm_fault_probe_array(int32_t kind);
 // (issues #1803, #1862).
 bool bitlinear_kernel_available();
 
+// Whether `quantized_matmul(x, weight, scales, biases)` with a transposed
+// affine weight runs the same dense GEMM that `dequantize` + `matmul` runs, so
+// the two return the same bytes (lablup/mlxcel#2081). On ROCm this reads the
+// QuantizedMatmul route (the fused WMMA kernel, the fp8 path and qmv differ;
+// dequantize + hipBLASLt matches), and x with a batch axis above 1 answers
+// false. Every other backend, and a ROCm build running on the CPU, answers
+// true: their eligibility rule is the output-tile count on the Rust side.
+bool quantized_matmul_matches_dense_gemm(
+    const MlxArray& x,
+    const MlxArray& weight,
+    const MlxArray& scales,
+    const MlxArray* biases,
+    int32_t group_size,
+    int32_t bits
+);
+
 // Fused sampling: top-k + top-p + min-p on the untempered distribution, then
 // one temperature scaling, then the categorical draw, in a single function
 // call to minimize FFI round-trips (chain order per issue #1379).
@@ -1938,9 +1962,24 @@ bool ssm_kernel_available();
 
 // Mamba1 selective scan fused over the sequence (Jamba, issue #2005).
 // x, delta: [batch, seq, d]; b, c: [batch, seq, n]; a: [d, n] (= -exp(A_log));
-// d: [d]; state_in: [batch, d, n]. y: [batch, seq, d] in x's dtype; state_out:
-// [batch, d, n] float32.
+// d: [d]; state_in: [batch, d, n]. y: [batch, seq, d] in x's dtype. On Metal
+// the state is carried and returned in float32. On CUDA (issue #1981) every
+// intermediate is rounded to x's dtype exactly as the per-step graph scan
+// rounds it, and state_out is in x's dtype.
 bool mamba1_scan_kernel_available();
+// Whether the fused scan can serve these inputs: the kernel is available, the
+// default device is the GPU, the state width fits one warp or simdgroup
+// (n <= 32), and on CUDA all six inputs share one floating dtype (the
+// condition under which the CUDA kernel is bit-identical to the graph scan it
+// replaces).
+bool mamba1_scan_kernel_accepts(
+    const MlxArray& x,
+    const MlxArray& delta,
+    const MlxArray& b,
+    const MlxArray& c,
+    const MlxArray& a,
+    const MlxArray& d
+);
 void mamba1_selective_scan(
     const MlxArray& x,
     const MlxArray& delta,
@@ -2406,6 +2445,16 @@ void paged_attention_merge_states(
     const MlxArray& o_indptr,
     std::unique_ptr<MlxArray>& v_out,
     std::unique_ptr<MlxArray>& lse_out);
+
+// Paged-attention port predicates, read from the kernels' own `KernelPorts`
+// tables through `has_kernel_port`, so a predicate cannot disagree with the
+// dispatch: all three kernels (v1 decode, v2 partial, merge); the merge kernel
+// alone; the v1 decode kernel alone; and the v2 pair (partial and merge).
+// Metal and CUDA today; ROCm answers false until lablup/mlxcel#1814.
+bool paged_attention_kernels_available();
+bool paged_attention_merge_available();
+bool paged_attention_decode_available();
+bool paged_attention_v2_available();
 
 // Query heads one v2 CTA processes together, forwarded from
 // `mlxcel::turbo::paged_attention_v2_q_heads_per_cta` (issue #898). Always

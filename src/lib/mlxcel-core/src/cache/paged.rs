@@ -816,6 +816,36 @@ impl PagedBlockPool {
             .map(|max| max.saturating_sub(self.live_block_count()))
     }
 
+    /// Blocks appending `token_count` tokens to every layer of `state` would
+    /// acquire from this pool (issue #1982).
+    ///
+    /// Per layer this is the new tail blocks [`Self::append_tokens`] pushes
+    /// (`(len + token_count).div_ceil(block_size) - block_ids.len()`), plus one
+    /// when the first new token lands in an existing partial tail block that
+    /// another owner still shares, because [`Self::write_prefill`] forks that
+    /// block with a copy-on-write before writing. The scheduler sums this over
+    /// a decode tick's rows and reclaims budget before the forward runs, since
+    /// a failed acquire inside the forward is fatal.
+    pub fn blocks_to_append(&self, state: &PagedSequenceState, token_count: usize) -> usize {
+        if token_count == 0 {
+            return 0;
+        }
+        let block_size = self.layout.block_size.max(1);
+        state
+            .layers
+            .iter()
+            .map(|layer| {
+                let required = (layer.len + token_count).div_ceil(block_size);
+                let fresh = required.saturating_sub(layer.block_ids.len());
+                let cow = layer
+                    .block_ids
+                    .get(layer.len / block_size)
+                    .is_some_and(|&tail| self.refcount(tail) > 1);
+                fresh + usize::from(cow)
+            })
+            .sum()
+    }
+
     /// Whether the pool's cache mode requires Turbo4 sidecar storage.
     ///
     /// Used by: paged detach/adopt to decide whether to round-trip sidecars,
@@ -1997,13 +2027,13 @@ impl PagedBlockPool {
             select_paged_v2_dispatch,
         };
 
-        // Both fused paths end in custom kernels with Metal and CUDA ports
-        // only. On a backend without them the launcher would reach
-        // `fast::cuda_kernel`, whose throw crosses the cxx bridge into a
-        // `noexcept` extern and ends the process, so decline before planning
-        // and let the caller's gather-then-SDPA fallback serve the step
-        // (issue #1803).
-        if !crate::ffi::custom_kernels_available() {
+        // Both fused paths end in the paged-attention kernels, which have
+        // Metal and CUDA ports only. On a backend without them the launch
+        // would be refused, so decline before planning and let the caller's
+        // gather-then-SDPA fallback serve the step (issue #1803). The
+        // predicate reads the kernels' own port tables, so a ROCm port
+        // (#1814) turns this path on without another edit here.
+        if !crate::ffi::paged_attention_kernels_available() {
             return Ok((
                 None,
                 PagedDecodeOutcome::NotServable(

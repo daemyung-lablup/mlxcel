@@ -693,28 +693,44 @@ fn fused_qk_norm_enabled_from(value: Option<&str>) -> bool {
     }
 }
 
-// ── Fused residual-add + RMSNorm (issue #905) ────────────────────────────────
+// ── Dense-GEMM prefill (issues #1994, #2001, #2081) ──────────────────────────
 
-/// Default for the fused residual-add + RMSNorm decode path.
-///
-/// **This is the one place to flip if the measurement does not justify the
-/// fusion.** `MLXCEL_FUSED_ADD_RMSNORM=0` disables it at runtime without a
-/// rebuild; setting this constant to `false` makes off the default and
-/// `MLXCEL_FUSED_ADD_RMSNORM=1` the opt-in.
-///
 /// Whether [`UnifiedLinear`] should run this quantized projection as
-/// `dequantize` + dense matmul (issues #1994, #2001): an affine weight whose
-/// scales share the input's dtype (f16 or bf16), a 2-D weight, at least
+/// `dequantize` + dense matmul (issues #1994, #2001, #2081): an affine weight
+/// whose scales share the input's dtype (f16 or bf16), a 2-D weight, at least
 /// `min_rows` input rows (the product of every axis but the last, so a server
-/// batch counts all of its rows), and more than 512 output tiles of 32 x 32.
+/// batch counts all of its rows), more than 512 output tiles of 32 x 32, and a
+/// backend whose `quantized_matmul` runs the same GEMM for this shape
+/// ([`ffi::quantized_matmul_matches_dense_gemm`]). The dense path is an
+/// optimization, so wherever it runs it must return the bytes
+/// `quantized_matmul` would have.
 ///
 /// With matching dtypes the dequantized weight equals what `quantized_matmul`
-/// reconstructs in registers, so the two differ only if they tile the output
-/// differently. Above 512 tiles they do not: an in-tree sweep over f16 and bf16,
-/// M 1024 and 2048, K 2048 to 4096 and N 256 to 4096 found identical bytes in
-/// every such cell, and differences only at or below 512 tiles (for example
-/// M 1024 with N 512 or narrower), where `qmm_splitk` targets about 512
-/// threadgroups. Those narrow projections stay on `quantized_matmul`.
+/// reconstructs in registers, so on Metal the two differ only if they tile the
+/// output differently. Above 512 tiles they do not: an in-tree sweep over f16
+/// and bf16, M 1024 and 2048, K 2048 to 4096 and N 256 to 4096 found identical
+/// bytes in every such cell, and differences only at or below 512 tiles (for
+/// example M 1024 with N 512 or narrower), where `qmm_splitk` targets about 512
+/// threadgroups. Those narrow projections stay on `quantized_matmul`. On Metal
+/// and CUDA the backend check always passes, so the tile count is the rule.
+///
+/// On ROCm the tile count says nothing: which kernel `quantized_matmul` runs
+/// depends on dtype, rows and device, and only one of its routes matches the
+/// dense path. Measured on gfx1151 (#2081), bf16, x `[1, 1024, 2048]` against
+/// a 4-bit g64 `[1024, 2048]` weight: the fused `qmm_wmma_dense_kernel`
+/// accumulates through rocWMMA 16 x 16 x 16 tiles in its own K order, and
+/// 499 of 1,048,576 outputs differed from `dequantize` + hipBLASLt (465 by
+/// 1 ULP, 10 by 2, 24 by more, all on outputs below 0.01 in magnitude where
+/// cancellation inflates the ULP distance). f16 matched because its
+/// `quantized_matmul` also dequantizes and calls hipBLASLt. The ROCm overlay
+/// now hands a bf16 GEMM of 128 rows or more on RDNA 3.5 to that same
+/// dequantize + hipBLASLt route, which was faster there on every shape
+/// measured (1.0x to 3.1x at 128 rows, up to 5.1x at 2048; LOCAL_FIXES
+/// item 29), so bf16 matches at those shapes too. The shapes that
+/// still take the WMMA kernel, the fp8 path or qmv (fewer rows, other devices,
+/// the `MLX_ROCM_*` overrides, a batch axis above 1) fail the backend check and
+/// stay on `quantized_matmul`. See
+/// `docs/benchmark_results/rocm-bf16-qmm-route-gfx1151-2026-09-30.md`.
 pub(crate) fn prefill_dense_gemm_eligible(
     x: &MlxArray,
     weight: &QuantizedWeight,
@@ -735,7 +751,22 @@ pub(crate) fn prefill_dense_gemm_eligible(
         .map(|&d| d as i64)
         .product();
     let tiles = ((rows + 31) / 32) * ((w_shape[0] as i64 + 31) / 32);
-    rows >= min_rows && tiles > DENSE_GEMM_MIN_OUTPUT_TILES
+    if rows < min_rows || tiles <= DENSE_GEMM_MIN_OUTPUT_TILES {
+        return false;
+    }
+    // SAFETY: every reference is a live array owned by `x` or `weight`, and
+    // `biases_ptr` is either null or points into `weight`, which outlives the
+    // call; the bridge only reads shapes and dtypes.
+    unsafe {
+        ffi::quantized_matmul_matches_dense_gemm(
+            x,
+            &weight.weight,
+            &weight.scales,
+            weight.biases_ptr(),
+            weight.group_size,
+            weight.bits,
+        )
+    }
 }
 
 /// Output-tile count (32 x 32 tiles of the `[rows, N]` result) at or below
@@ -780,6 +811,15 @@ fn dense_gemm(
     }
 }
 
+// ── Fused residual-add + RMSNorm (issue #905) ────────────────────────────────
+
+/// Default for the fused residual-add + RMSNorm decode path.
+///
+/// **This is the one place to flip if the measurement does not justify the
+/// fusion.** `MLXCEL_FUSED_ADD_RMSNORM=0` disables it at runtime without a
+/// rebuild; setting this constant to `false` makes off the default and
+/// `MLXCEL_FUSED_ADD_RMSNORM=1` the opt-in.
+///
 /// Default-OFF: measured, and the measurement did not justify wiring it on.
 ///
 /// Op-level microbench on Apple M1 Ultra (Metal, f16, hidden {2048, 4096,
@@ -5748,23 +5788,24 @@ pub(crate) fn resolve_paged_v2_dispatch(
 
 /// The backend the fused kernel would run on, cached for the decode hot path.
 ///
-/// The fused kernel has a Metal JIT body and a CUDA JIT body (#634), so it is a
-/// native candidate whenever either backend is available at runtime
-/// ([`crate::metal_is_available`] / [`crate::cuda_is_available`], the same gates
-/// the model dispatch and C++ kernel selection use). This correctly falls to
-/// gather only for a CPU-only build or a machine with no usable GPU, neither of
-/// which a compile-time `target_os` check would catch. Metal is probed first so
-/// the Apple path is unchanged. Detection is process-static, so it is read once.
+/// The fused kernel has a Metal JIT body and a CUDA JIT body (#634) and no HIP
+/// port yet (#1814). It is a native candidate only when
+/// [`crate::paged_attention_decode_available`] says the resolved backend has a
+/// port in the kernel's own table; then [`crate::metal_is_available`] /
+/// [`crate::cuda_is_available`] name which one. A CPU-only build, a machine
+/// with no usable GPU and a ROCm build all fall to gather, none of which a
+/// compile-time `target_os` check would catch. Metal is probed first so the
+/// Apple path is unchanged. Detection is process-static, so it is read once.
 pub(crate) fn paged_decode_backend() -> PagedDecodeBackend {
     use std::sync::OnceLock;
     static BACKEND: OnceLock<PagedDecodeBackend> = OnceLock::new();
     *BACKEND.get_or_init(|| {
-        // Asked first, so a backend with no fused kernel port can never be
-        // read as one that has it. `cuda_is_available()` is false on a ROCm
-        // build today, so this is belt and braces rather than a live fix, but
-        // the old order made correctness depend on that staying true
-        // (issue #1803).
-        if !crate::custom_kernels_available() {
+        // Asked first, so a backend with no paged-attention kernel port can
+        // never be read as one that has it. `cuda_is_available()` is false on
+        // a ROCm build today, so this is belt and braces rather than a live
+        // fix, but the old order made correctness depend on that staying true
+        // (issue #1803). The predicate reads the kernel's own port table.
+        if !crate::paged_attention_decode_available() {
             PagedDecodeBackend::Other
         } else if crate::metal_is_available() {
             PagedDecodeBackend::Metal
@@ -6336,6 +6377,11 @@ mod tests {
     /// more than 512 output tiles, the dense path returns the same bytes as
     /// `quantized_matmul`, with and without a linear bias. Narrow outputs
     /// (512 tiles or fewer), mixed dtypes and short inputs are not eligible.
+    ///
+    /// On ROCm (#2081) the same holds only where `quantized_matmul` runs the
+    /// dequantize + hipBLASLt route, so the ROCm block below checks the
+    /// guarantee itself on shapes that reach other routes: any shape the rule
+    /// accepts must match, and a shape whose bytes differ must be refused.
     #[test]
     fn prefill_dense_gemm_matches_qmm_bytes_where_eligible() {
         let (rows, k) = (1024, 2048);
@@ -6343,11 +6389,31 @@ mod tests {
             let x = ffi::astype(&seeded(&[1, rows, k], 11), dt);
             let wide = quantized_4bit(&ffi::astype(&seeded(&[1024, k], 7), dt));
             let bias = ffi::astype(&seeded(&[1024], 13), dt);
-            assert!(prefill_dense_gemm_eligible(&x, &wide, 1024), "dtype {dt}");
+            // 1024 rows x 512 columns is exactly 512 tiles: MLX tiles the two
+            // paths differently there, so it must stay on qmm.
+            let narrow = quantized_4bit(&ffi::astype(&seeded(&[512, k], 7), dt));
+            assert!(
+                !prefill_dense_gemm_eligible(&x, &narrow, 1),
+                "dtype {dt}: narrow N"
+            );
             assert!(
                 !prefill_dense_gemm_eligible(&x, &wide, 1025),
                 "dtype {dt}: min rows"
             );
+
+            // On ROCm eligibility also depends on the device's qmm route
+            // (#2081). On the measured route both dtypes take dequantize +
+            // hipBLASLt at 1024 rows; elsewhere a refused shape skips the byte
+            // check instead of failing it.
+            let eligible = prefill_dense_gemm_eligible(&x, &wide, 1024);
+            let rocm = crate::hardware::gpu_backend_kind() == crate::hardware::GpuBackendKind::Rocm;
+            if rocm && !rocm_measured_route() && !eligible {
+                eprintln!(
+                    "skipping dtype {dt} byte check: this ROCm device's qmm route differs from dequantize + hipBLASLt (lablup/mlxcel#2081)"
+                );
+                continue;
+            }
+            assert!(eligible, "dtype {dt}");
             for b in [None, Some(&bias)] {
                 let bias_ptr = b
                     .map(|b| b.as_ref().unwrap() as *const MlxArray)
@@ -6372,14 +6438,10 @@ mod tests {
                     b.is_some()
                 );
             }
+        }
 
-            // 1024 rows x 512 columns is exactly 512 tiles: MLX tiles the two
-            // paths differently there, so it must stay on qmm.
-            let narrow = quantized_4bit(&ffi::astype(&seeded(&[512, k], 7), dt));
-            assert!(
-                !prefill_dense_gemm_eligible(&x, &narrow, 1),
-                "dtype {dt}: narrow N"
-            );
+        if crate::hardware::gpu_backend_kind() == crate::hardware::GpuBackendKind::Rocm {
+            prefill_dense_gemm_rocm_route_guard(k);
         }
 
         let x16 = ffi::astype(&seeded(&[1, rows, k], 11), crate::dtype::FLOAT16);
@@ -6388,6 +6450,89 @@ mod tests {
         assert!(
             !prefill_dense_gemm_eligible(&x16, &wbf, 1),
             "bf16 scales with an f16 input must stay on qmm"
+        );
+    }
+
+    /// True on gfx1151, the device the ROCm qmm routes were measured on
+    /// (#2081), when no environment variable that moves a route is set.
+    fn rocm_measured_route() -> bool {
+        crate::rocm_arch::device_gfx_target() == Some("gfx1151")
+            && [
+                "MLX_ROCM_WMMA_QMM",
+                "MLX_ROCM_WMMA_QMM_MAX_M",
+                "MLX_ROCM_QMM_DEQUANT_GEMM",
+                "MLX_ROCM_QMM_DEQUANT_M_THRESHOLD",
+                "MLX_NO_HIPBLASLT",
+                "MLX_ROCM_FORCE_LOW_CU",
+                "MLX_ROCM_FORCE_WARP_SIZE",
+            ]
+            .iter()
+            .all(|name| std::env::var_os(name).is_none())
+    }
+
+    /// ROCm half of [`prefill_dense_gemm_matches_qmm_bytes_where_eligible`]:
+    /// shapes that pass the tile rule but reach different `quantized_matmul`
+    /// routes. Everywhere, a shape the rule accepts must match. On the
+    /// measured route, bf16 at 64 rows takes the fused WMMA kernel, whose
+    /// bytes differ, so the rule must refuse it, while f16 at 64 rows and bf16
+    /// at 256 rows take dequantize + hipBLASLt and must be accepted. A batch
+    /// axis above 1 makes `quantized_matmul` batch the GEMM, so it is refused
+    /// whatever the bytes.
+    fn prefill_dense_gemm_rocm_route_guard(k: i32) {
+        let measured = rocm_measured_route();
+        let mut refused_differing = 0;
+        for (dt, rows, n, expect_eligible) in [
+            (crate::dtype::BFLOAT16, 64, 8448, false),
+            (crate::dtype::FLOAT16, 64, 8448, true),
+            (crate::dtype::BFLOAT16, 256, 4096, true),
+        ] {
+            let x = ffi::astype(&seeded(&[1, rows, k], 17), dt);
+            let w = quantized_4bit(&ffi::astype(&seeded(&[n, k], 19), dt));
+            let want = unsafe {
+                ffi::quantized_linear_forward(
+                    &x,
+                    &w.weight,
+                    &w.scales,
+                    w.biases_ptr(),
+                    std::ptr::null(),
+                    w.group_size,
+                    w.bits,
+                    &w.mode,
+                )
+            };
+            let same = raw_bytes(&dense_gemm(&x, &w, None)) == raw_bytes(&want);
+            let eligible = prefill_dense_gemm_eligible(&x, &w, 1);
+            eprintln!(
+                "rocm route guard: dtype {dt} rows {rows} N {n}: eligible {eligible}, same bytes {same}"
+            );
+            assert!(
+                !eligible || same,
+                "dtype {dt} rows {rows} N {n}: eligible, but dense GEMM differs from qmm"
+            );
+            if measured {
+                assert_eq!(
+                    eligible, expect_eligible,
+                    "dtype {dt} rows {rows} N {n}: eligibility on gfx1151"
+                );
+            }
+            if !same {
+                refused_differing += 1;
+            }
+        }
+        if measured {
+            // The bf16 64-row case must really differ, or this guard would
+            // pass with the route check removed.
+            assert!(
+                refused_differing >= 1,
+                "no differing shape exercised the route check"
+            );
+        }
+
+        let batched_x = ffi::astype(&seeded(&[2, 512, k], 23), crate::dtype::BFLOAT16);
+        let w = quantized_4bit(&ffi::astype(&seeded(&[1024, k], 7), crate::dtype::BFLOAT16));
+        assert!(
+            !prefill_dense_gemm_eligible(&batched_x, &w, 1),
+            "a batch axis above 1 must stay on qmm on ROCm"
         );
     }
 

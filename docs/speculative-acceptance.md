@@ -111,6 +111,7 @@ real and provable.
 | Path | `temperature == 0` | `temperature > 0` default | `temperature > 0` opt-in |
 |------|--------------------|---------------------------|--------------------------|
 | `SpeculativeGenerator` (classic; `mlxcel generate --draft-model`) | greedy argmax (lossless) | **sampler-match** (lossless) | modified rejection sampling (lossless, acceptance-optimal) |
+| `PromptLookupGenerator` (`mlxcel generate --prompt-lookup`) | greedy argmax (lossless) | **sampler-match** (lossless, and acceptance-optimal here) | none needed |
 | Gemma 4 MTP round loop | argmax (lossless here) | argmax-against-argmax (**biased**) | not wired |
 | DFlash round loop (Qwen 3.5 DFlash drafter) | argmax (lossless here) | argmax-against-argmax (**biased**) | not wired |
 | DFlash round loop (LFM2 DSpark drafter) | argmax (lossless here, probe-gated) | declines to classic decode | not wired |
@@ -124,6 +125,13 @@ widening both the drafter interface and `MtpTarget::verify_forward`'s output.
 Those are the paths where this feature would buy correctness rather than only
 acceptance rate, and where the acceptance trade against argmax is a real
 decision rather than a free win.
+
+Prompt lookup proposes deterministically, so its `q` is one-hot on the drafted
+token `d`. The two acceptance probabilities then coincide at `p(d)`
+(`sum_x p(x) q(x) = sum_x min(p(x), q(x)) = p(d)`), and on a rejection both
+rules emit a draw from `p` conditioned on not being `d`. Sampler-match is
+therefore already the acceptance-optimal rule for that path, and there is
+nothing to opt into.
 
 ## RNG dependency
 

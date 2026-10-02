@@ -88,7 +88,7 @@
 //! state that cannot be trimmed; callers must refuse them, see
 //! [`prompt_lookup_unsupported_reason`].
 
-use crate::cache::{KVCacheMode, can_trim_prompt_cache};
+use crate::cache::{KVCacheMode, SequenceStateBackend, can_trim_prompt_cache};
 use crate::drafter::dflash::materialize_argmax_i32_vec;
 use crate::ffi;
 use crate::ffi::MlxThreadLocalStream;
@@ -99,7 +99,9 @@ use crate::generate::{
 use crate::generation_policy::{initial_token_history, merged_eos_token_ids, seed_rng_if_needed};
 use crate::layers::KVCache;
 use crate::loop_detection::detect_repetition_loop;
-use crate::sampling::{TokenBiasMap, sample_token_optimized};
+use crate::sampling::{
+    SamplerState, TokenBiasMap, sample_token_optimized, sample_token_optimized_with_state,
+};
 use crate::streams::{install_thread_local_default_stream, shared_thread_local_generation_stream};
 use cxx::UniquePtr;
 use std::borrow::Cow;
@@ -119,6 +121,17 @@ pub const DEFAULT_NGRAM_MAX: usize = 3;
 pub const DEFAULT_NGRAM_MIN: usize = 2;
 /// Default maximum number of tokens proposed per round (verify block of 8).
 pub const DEFAULT_MAX_DRAFT: usize = 7;
+/// Largest accepted `ngram_max`.
+///
+/// [`NgramIndex`] keeps one map per n-gram length in `ngram_min..=ngram_max`,
+/// and each map holds a boxed `n`-token key for every context position, so its
+/// host memory grows with the square of the range times the context length.
+/// Without a bound, a mistyped `--prompt-lookup-ngram-max 1000` over a long
+/// document asks for hundreds of gigabytes before the first decode step.
+pub const NGRAM_MAX_LIMIT: usize = 16;
+/// Largest accepted `max_draft`. The verify block is one wider, and every
+/// proposal is a forward position the target computes.
+pub const MAX_DRAFT_LIMIT: usize = 64;
 
 /// Tunables for [`PromptLookupGenerator`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -157,8 +170,20 @@ impl PromptLookupConfig {
                 self.ngram_max, self.ngram_min
             ));
         }
+        if self.ngram_max > NGRAM_MAX_LIMIT {
+            return Err(format!(
+                "prompt-lookup ngram-max ({}) must be at most {NGRAM_MAX_LIMIT}",
+                self.ngram_max
+            ));
+        }
         if self.max_draft == 0 {
             return Err("prompt-lookup max-draft must be at least 1".to_string());
+        }
+        if self.max_draft > MAX_DRAFT_LIMIT {
+            return Err(format!(
+                "prompt-lookup max-draft ({}) must be at most {MAX_DRAFT_LIMIT}",
+                self.max_draft
+            ));
         }
         Ok(())
     }
@@ -169,16 +194,31 @@ impl PromptLookupConfig {
 ///
 /// Verification rolls rejected tokens back with `KVCache::trim`, which is only
 /// sound when every piece of per-sequence state lives in the external caches.
-/// `supports_batching` is the existing marker for that, and
+/// `supports_batching` is the existing marker for that, and a
+/// [`SequenceStateBackend::ModelOwned`] layout is the direct statement of the
+/// opposite: such a family keeps its caches inside the model, the external
+/// caches are empty placeholders, and trimming them rolls nothing back.
 /// `supports_padded_prefill` is `false` for the families whose state trailing
 /// tokens corrupt past what a trim undoes, which is the same hazard a rejected
 /// draft block poses.
+///
+/// The layout check keeps the refusal from resting on the other two flags:
+/// Gemma 4 and Llama 4 report `supports_batching() == true` and were refused
+/// only because they opt out of padded prefill, a flag that answers a
+/// different question (the scheduler's post-pad trim, issue #1335) and may
+/// change once that is solved.
 pub fn prompt_lookup_unsupported_reason<M: LanguageModel>(model: &M) -> Option<&'static str> {
     if !model.supports_batching() {
         return Some(
             "this model keeps sequence state outside the external KV caches (recurrent or \
              hybrid layers, or model-owned sliding-window caches), so a rejected draft \
              cannot be rolled back",
+        );
+    }
+    if model.sequence_state_layout().backend == SequenceStateBackend::ModelOwned {
+        return Some(
+            "this model owns its attention caches internally rather than in the external KV \
+             caches the generator trims, so a rejected draft cannot be rolled back",
         );
     }
     if !model.supports_padded_prefill() {
@@ -487,6 +527,43 @@ impl PromptLookupGenerator {
         self.stats
     }
 
+    /// Prefill `prompt_tokens` and run one verify forward at every block
+    /// width [`Self::generate`] can use (2 through `max_draft + 1`), so a
+    /// later call does not pay first-use costs in the middle of its decode.
+    ///
+    /// The first forward at a width this process has not run yet builds or
+    /// traces kernels for it, which on GB10 cost more than the rest of a
+    /// short reply: a 72-token Qwen3-1.7B answer with two drafted rounds ran
+    /// at 0.65x plain decoding without this warmup and at 1.07x with it. A
+    /// warmup generation only reaches the widths its own proposals happen to
+    /// use, which on a reply with nothing to copy is none of them.
+    ///
+    /// # Panics
+    ///
+    /// Same contract as [`Self::generate`] for the model and the prompt.
+    pub fn warm_up_verify_widths<M: LanguageModel>(&mut self, model: &M, prompt_tokens: &[i32]) {
+        self.reset(model);
+        assert!(
+            !self.caches.is_empty() && can_trim_prompt_cache(&self.caches),
+            "prompt-lookup decoding requires trimmable external KV caches"
+        );
+        let last = *prompt_tokens
+            .last()
+            .expect("prompt-lookup warmup requires at least one prompt token");
+        install_thread_local_default_stream(self.generation_stream.as_ref());
+        let logits = prefill_prompt_last_logits(model, &mut self.caches, prompt_tokens);
+        ffi::eval(&logits);
+        for width in 2..=self.config.max_draft + 1 {
+            let tokens = vec![last; width];
+            let input = ffi::from_slice_i32(&tokens, &[1, width as i32]);
+            let logits = model.forward(&input, &mut self.caches, None);
+            let argmax = ffi::argmax_last_axis(&logits);
+            ffi::eval(&argmax);
+            trim_caches(&mut self.caches, width as i32);
+        }
+        ffi::clear_memory_cache();
+    }
+
     /// Fresh caches from the model, in the configured mode, as
     /// `CxxGenerator::reset_with_model` builds them.
     fn reset<M: LanguageModel>(&mut self, model: &M) {
@@ -521,8 +598,12 @@ impl PromptLookupGenerator {
     ///
     /// # Panics
     ///
-    /// Panics on an empty prompt or a non-trimmable cache. Callers must check
-    /// [`supports_prompt_lookup`] first.
+    /// Panics on an empty prompt, on a model with no external KV caches or a
+    /// non-trimmable one (callers must check [`supports_prompt_lookup`]
+    /// first), and on a sampler that carries feedback state across tokens
+    /// (mirostat, adaptive-p), which this loop does not thread through its
+    /// rounds; the server's speculative burst declines the same samplers.
+    /// `mlxcel generate` cannot configure either one.
     pub fn generate<M: LanguageModel>(
         &mut self,
         model: &M,
@@ -532,9 +613,11 @@ impl PromptLookupGenerator {
     ) -> (Vec<i32>, GenerationStats) {
         self.reset(model);
 
+        // `can_trim_prompt_cache` is vacuously true on an empty slice, which
+        // is exactly what a family that keeps its caches internally returns.
         assert!(
-            can_trim_prompt_cache(&self.caches),
-            "prompt-lookup decoding requires a trimmable prompt cache"
+            !self.caches.is_empty() && can_trim_prompt_cache(&self.caches),
+            "prompt-lookup decoding requires trimmable external KV caches"
         );
         assert!(
             !prompt_tokens.is_empty(),
@@ -543,12 +626,22 @@ impl PromptLookupGenerator {
 
         let sampling_cow = self.compose_sampling(sampling);
         let sampling: &SamplingConfig = sampling_cow.as_ref();
+        assert!(
+            !sampling.needs_sampler_feedback_state(),
+            "prompt-lookup decoding does not carry mirostat or adaptive-p sampler state"
+        );
         seed_rng_if_needed(sampling);
         install_thread_local_default_stream(self.generation_stream.as_ref());
 
         let eos_tokens = merged_eos_token_ids(model.eos_token_ids(), &sampling.stop_token_ids);
         let needs_history = sampling.needs_token_history();
         let mut token_history = initial_token_history(prompt_tokens, needs_history);
+        // Incremental penalty state, as `CxxGenerator` keeps it: byte-identical
+        // logits to rebuilding the penalties from `token_history` on every
+        // sample, without the per-sample pass over the whole history. History
+        // only grows here (rejected proposals are never sampled into it), so
+        // the state's append-only fast path always applies.
+        let mut sampler_state: Option<SamplerState> = None;
         // Pure argmax with nothing that depends on the emitted prefix: every
         // verify position can be decided from one batched argmax and a single
         // host read. Anything else goes position by position through the
@@ -563,7 +656,11 @@ impl PromptLookupGenerator {
         let prefill_start = Instant::now();
         let logits = prefill_prompt_last_logits(model, &mut self.caches, prompt_tokens);
         ffi::clear_memory_cache();
-        let (first_arr, _) = sample_token_optimized(&logits, sampling, &token_history);
+        let (first_arr, _) = if needs_history {
+            sample_token_optimized_with_state(&logits, sampling, &token_history, &mut sampler_state)
+        } else {
+            sample_token_optimized(&logits, sampling, &token_history)
+        };
         ffi::async_eval(&first_arr);
         // Index the prompt while the GPU finishes the prefill.
         let mut index = NgramIndex::new(&self.config);
@@ -685,8 +782,16 @@ impl PromptLookupGenerator {
                     None => {
                         let pos_logits =
                             ffi::slice(&logits, &[0, pos as i32, 0], &[1, pos as i32 + 1, vocab]);
-                        let (arr, _) =
-                            sample_token_optimized(&pos_logits, sampling, &token_history);
+                        let (arr, _) = if needs_history {
+                            sample_token_optimized_with_state(
+                                &pos_logits,
+                                sampling,
+                                &token_history,
+                                &mut sampler_state,
+                            )
+                        } else {
+                            sample_token_optimized(&pos_logits, sampling, &token_history)
+                        };
                         ffi::eval(&arr);
                         ffi::item_i32(&arr)
                     }

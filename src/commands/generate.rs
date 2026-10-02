@@ -1972,13 +1972,34 @@ pub(super) fn run_generation_mode(
     Ok(output)
 }
 
+/// Refuse a `--prompt-lookup` run that cannot start, before the checkpoint is
+/// resolved or loaded: an invalid lookup configuration, or multimodal input,
+/// whose embeddings the generator cannot take. A no-op without the flag.
+pub(super) fn validate_prompt_lookup_args(args: &GenerateArgs) -> Result<()> {
+    if !args.prompt_lookup.prompt_lookup {
+        return Ok(());
+    }
+    args.prompt_lookup
+        .config()
+        .validate()
+        .map_err(|err| anyhow!("--prompt-lookup: {err}"))?;
+    ensure!(
+        args.generation.image.is_empty()
+            && args.generation.audio.is_none()
+            && args.generation.video.is_empty(),
+        "--prompt-lookup supports text-only prompts; drop --image/--audio/--video"
+    );
+    Ok(())
+}
+
 /// Offline prompt-lookup speculative decoding (`--prompt-lookup`).
 ///
 /// Refuses the model families whose state cannot be rewound after a rejected
 /// block, and multimodal prompts, whose embeddings the generator cannot take.
 /// Runs one short warmup generation first, as `generate_standard` does, so the
-/// timed run does not pay for kernel compilation. The warmup decodes a few
-/// rounds rather than one token so the verify widths get compiled too.
+/// timed run does not pay for kernel compilation, then one forward at every
+/// verify width so the widths the warmup's own proposals missed are compiled
+/// too.
 ///
 /// The returned stats time the whole call, prefill included, exactly as
 /// `generate_standard` does, so the printed tok/s compares like for like.
@@ -2008,6 +2029,10 @@ fn run_prompt_lookup(
         .with_token_bias(token_bias);
     let warmup_tokens = args.generation.max_tokens.min(16);
     let _ = generator.generate(model, prompt_tokens, warmup_tokens, sampling_config);
+    // The warmup generation compiles only the verify widths its own proposals
+    // used; a reply with nothing to copy uses none, and the timed run would
+    // then pay each width's first-use cost mid-decode.
+    generator.warm_up_verify_widths(model, prompt_tokens);
     let start_time = Instant::now();
     let (tokens, measured) = generator.generate(
         model,
@@ -2662,6 +2687,10 @@ fn run_generate_once(mut args: GenerateArgs) -> Result<()> {
     // a malformed surgery config never triggers an auto-download.
     #[cfg(feature = "surgery")]
     install_surgery_pipeline_from_cli(&args)?;
+
+    // Model-independent too, so a bad `--prompt-lookup` combination fails
+    // before the resolver below can auto-download the checkpoint.
+    validate_prompt_lookup_args(&args)?;
 
     // Resolve `-m` into a concrete model directory (epic #92, issue #94)
     // before any consumer reads it. An existing path is used verbatim

@@ -21,7 +21,7 @@ use super::{
     generated_suffix, generation_stats_from_duration, memory_preflight_ctx_len,
     reject_dflash_drafter_offline, resolve_cli_pipeline_assignments, resolve_cli_prompt,
     should_route_offline_mtp, strip_trailing_eos, validate_muse_glimmer_cli_unsupported_options,
-    validate_pipeline_parallel_args, validate_tensor_parallel_args,
+    validate_pipeline_parallel_args, validate_prompt_lookup_args, validate_tensor_parallel_args,
     validate_xla_cli_image_cardinality, validate_xla_output_audio,
 };
 use mlxcel::server::chat_template::{ChatMessage, ChatTemplateProcessor, flatten_template_text};
@@ -965,6 +965,9 @@ fn validate_pipeline_parallel_args_rejects_incompatible_modes() {
     args.model.draft_model = Some(PathBuf::from("draft"));
     assert!(validate_pipeline_parallel_args(&args).is_err());
     args.model.draft_model = None;
+    args.prompt_lookup.prompt_lookup = true;
+    assert!(validate_pipeline_parallel_args(&args).is_err());
+    args.prompt_lookup.prompt_lookup = false;
 
     // Tensor parallelism + PP is now accepted (2D PP × TP composition landed). Positive coverage for the 2D path lives in
     // `validate_pipeline_parallel_args_accepts_2d_pp_tp` below.
@@ -1417,4 +1420,44 @@ fn cli_video_frames_are_private_and_removed_with_the_run() {
         assert!(!frame.exists(), "{} outlived the run", frame.display());
     }
     assert!(!dir.exists(), "the frame directory outlived the run");
+}
+
+#[test]
+fn validate_prompt_lookup_args_is_a_no_op_without_the_flag() {
+    let mut args = sample_generate_args(temp_model_dir("pl-disabled"));
+    args.generation.image = vec![PathBuf::from("page.png")];
+    args.prompt_lookup.prompt_lookup_ngram_min = 0;
+    assert!(validate_prompt_lookup_args(&args).is_ok());
+    fs::remove_dir_all(args.model.model).unwrap();
+}
+
+#[test]
+fn validate_prompt_lookup_args_refuses_before_the_model_loads() {
+    let mut args = sample_generate_args(temp_model_dir("pl-refusals"));
+    args.prompt_lookup.prompt_lookup = true;
+    assert!(validate_prompt_lookup_args(&args).is_ok());
+
+    args.prompt_lookup.prompt_lookup_ngram_min = 0;
+    let err = validate_prompt_lookup_args(&args).unwrap_err().to_string();
+    assert!(err.contains("ngram-min"), "{err}");
+    args.prompt_lookup.prompt_lookup_ngram_min = 2;
+
+    args.prompt_lookup.prompt_lookup_ngram_max =
+        mlxcel_core::speculative::prompt_lookup::NGRAM_MAX_LIMIT + 1;
+    let err = validate_prompt_lookup_args(&args).unwrap_err().to_string();
+    assert!(err.contains("at most"), "{err}");
+    args.prompt_lookup.prompt_lookup_ngram_max = 3;
+
+    for media in ["image", "audio", "video"] {
+        let mut args = sample_generate_args(args.model.model.clone());
+        args.prompt_lookup.prompt_lookup = true;
+        match media {
+            "image" => args.generation.image = vec![PathBuf::from("page.png")],
+            "audio" => args.generation.audio = Some(PathBuf::from("clip.wav")),
+            _ => args.generation.video = vec![PathBuf::from("clip.mp4")],
+        }
+        let err = validate_prompt_lookup_args(&args).unwrap_err().to_string();
+        assert!(err.contains("text-only"), "{media}: {err}");
+    }
+    fs::remove_dir_all(args.model.model).unwrap();
 }

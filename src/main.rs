@@ -384,20 +384,35 @@ pub(crate) struct PromptLookupOptions {
     pub(crate) prompt_lookup: bool,
 
     /// Longest suffix n-gram matched against the context
-    #[arg(long, default_value_t = mlxcel::PromptLookupConfig::default().ngram_max, value_name = "N")]
+    #[arg(
+        long,
+        requires = "prompt_lookup",
+        default_value_t = mlxcel::PromptLookupConfig::default().ngram_max,
+        value_name = "N"
+    )]
     pub(crate) prompt_lookup_ngram_max: usize,
 
     /// Shortest suffix n-gram matched against the context
-    #[arg(long, default_value_t = mlxcel::PromptLookupConfig::default().ngram_min, value_name = "N")]
+    #[arg(
+        long,
+        requires = "prompt_lookup",
+        default_value_t = mlxcel::PromptLookupConfig::default().ngram_min,
+        value_name = "N"
+    )]
     pub(crate) prompt_lookup_ngram_min: usize,
 
     /// Maximum tokens proposed per round (the verify block is one wider)
-    #[arg(long, default_value_t = mlxcel::PromptLookupConfig::default().max_draft, value_name = "N")]
+    #[arg(
+        long,
+        requires = "prompt_lookup",
+        default_value_t = mlxcel::PromptLookupConfig::default().max_draft,
+        value_name = "N"
+    )]
     pub(crate) prompt_lookup_max_draft: usize,
 
     /// Propose up to the maximum every round, instead of shortening or pausing
     /// proposals while they stop landing (for A/B measurement)
-    #[arg(long)]
+    #[arg(long, requires = "prompt_lookup")]
     pub(crate) prompt_lookup_no_adaptive: bool,
 }
 

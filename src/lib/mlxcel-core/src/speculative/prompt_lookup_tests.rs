@@ -311,3 +311,328 @@ fn without_the_loop_guard_lookup_runs_to_max_tokens() {
         generator.generate(&ConstantModel, &[1, 2, 3, 3], 64, &SamplingConfig::greedy());
     assert_eq!(tokens, vec![3; 64]);
 }
+
+#[test]
+fn config_validation_bounds_the_index_and_the_verify_block() {
+    assert!(cfg(NGRAM_MAX_LIMIT, 2, MAX_DRAFT_LIMIT).validate().is_ok());
+    let err = cfg(NGRAM_MAX_LIMIT + 1, 2, 7).validate().unwrap_err();
+    assert!(err.contains("ngram-max"), "{err}");
+    let err = cfg(3, 2, MAX_DRAFT_LIMIT + 1).validate().unwrap_err();
+    assert!(err.contains("max-draft"), "{err}");
+}
+
+/// Vocabulary of [`InductionModel`].
+const INDUCTION_VOCAB: usize = 6;
+
+/// Target whose prediction depends on everything in its KV cache, so a
+/// rollback that leaves a rejected proposal behind, or trims one token too
+/// many, changes what it predicts from then on.
+///
+/// Each forward appends its input tokens to the cache as key values and, at
+/// every new position, predicts the token that followed an earlier occurrence
+/// of the token at that position (a one-token induction head over the cached
+/// sequence), or `token + 1` when there is none. The following token gets a
+/// runner-up logit, so a repetition penalty can flip the choice.
+///
+/// With `earliest: false` it copies from the most recent occurrence, the one
+/// lookup also prefers, so most proposals land and the governor keeps full
+/// blocks. With `earliest: true` it copies from the first occurrence, so
+/// proposals keep missing, the governor pauses, and the decode loop pipelines
+/// runs of plain rounds and switches back to verifying when a pause ends.
+struct InductionModel {
+    earliest: bool,
+}
+
+const INDUCTION_MODELS: [InductionModel; 2] = [
+    InductionModel { earliest: false },
+    InductionModel { earliest: true },
+];
+
+impl LanguageModel for InductionModel {
+    fn forward(
+        &self,
+        input_ids: &ffi::MlxArray,
+        caches: &mut [KVCache],
+        _mask: Option<&ffi::MlxArray>,
+    ) -> UniquePtr<ffi::MlxArray> {
+        let seq_len = ffi::array_shape(input_ids)[1];
+        let as_f16 = ffi::astype(input_ids, crate::dtype::FLOAT16);
+        let keys = ffi::reshape(&as_f16, &[1, 1, seq_len, 1]);
+        let values = ffi::reshape(&as_f16, &[1, 1, seq_len, 1]);
+        let (window, _) = caches[0].update_and_fetch(keys, values);
+        let sequence: Vec<i32> = crate::utils::array_to_vec_f32(&window)
+            .into_iter()
+            .map(|v| v as i32)
+            .collect();
+        let new_len = seq_len as usize;
+        let mut logits = vec![0.0f32; new_len * INDUCTION_VOCAB];
+        for (row, pos) in (sequence.len() - new_len..sequence.len()).enumerate() {
+            let token = sequence[pos];
+            let mut earlier = (0..pos).filter(|&i| sequence[i] == token);
+            let source = if self.earliest {
+                earlier.next()
+            } else {
+                earlier.next_back()
+            };
+            let next =
+                source.map_or((token + 1) % INDUCTION_VOCAB as i32, |i| sequence[i + 1]) as usize;
+            logits[row * INDUCTION_VOCAB + next] = 8.0;
+            logits[row * INDUCTION_VOCAB + (next + 1) % INDUCTION_VOCAB] = 7.0;
+        }
+        ffi::from_slice_f32(&logits, &[1, seq_len, INDUCTION_VOCAB as i32])
+    }
+
+    fn make_caches(&self) -> Vec<KVCache> {
+        vec![KVCache::new()]
+    }
+
+    fn num_layers(&self) -> usize {
+        1
+    }
+
+    fn eos_token_ids(&self) -> Vec<i32> {
+        Vec::new()
+    }
+}
+
+/// Plain decoding without pipelining: one forward per token, each sampled
+/// against a history that already holds every emitted token, which is what a
+/// history-reading sampler is defined against (mlx-lm's `generate_step` hands
+/// its logits processors the token it just consumed).
+///
+/// `CxxGenerator` cannot be the reference once the sampler reads history: its
+/// pipelined loop builds the next step's sample before it pushes the token it
+/// has just read, so its penalties see a history one token stale.
+fn sequential_reference<M: LanguageModel>(
+    model: &M,
+    prompt: &[i32],
+    max_tokens: usize,
+    sampling: &SamplingConfig,
+) -> Vec<i32> {
+    let mut caches = model.make_caches();
+    let mut history = prompt.to_vec();
+    let mut input = prompt.to_vec();
+    let mut emitted = Vec::with_capacity(max_tokens);
+    while emitted.len() < max_tokens {
+        let ids = ffi::from_slice_i32(&input, &[1, input.len() as i32]);
+        let logits = model.forward(&ids, &mut caches, None);
+        let (token, _) = sample_token_optimized(&logits, sampling, &history);
+        let token = ffi::item_i32(&token);
+        emitted.push(token);
+        history.push(token);
+        input = vec![token];
+    }
+    emitted
+}
+
+/// Run prompt lookup on both [`INDUCTION_MODELS`] over several prompts and
+/// configurations, assert every reply equals `reference(model, prompt)`, and
+/// return the summed acceptance accounting per model.
+fn induction_parity(
+    sampling: &SamplingConfig,
+    reference: impl Fn(&InductionModel, &[i32]) -> Vec<i32>,
+) -> [PromptLookupStats; 2] {
+    let mut totals = [PromptLookupStats::default(); 2];
+    for (model, total) in INDUCTION_MODELS.iter().zip(&mut totals) {
+        for seed in 1..=6 {
+            let prompt = lcg_tokens(seed, 48, INDUCTION_VOCAB as u64);
+            let expected = reference(model, &prompt);
+            assert_eq!(expected.len(), 96, "seed {seed}: the reference ran short");
+            for config in [
+                PromptLookupConfig::default(),
+                cfg(3, 1, 7),
+                cfg(4, 2, 3),
+                // Six-token matches are rare in a random prompt and appear
+                // once the reply repeats itself, so the loop first pipelines a
+                // long run of plain rounds and then switches to verifying with
+                // a step still in flight.
+                cfg(6, 6, 7),
+                PromptLookupConfig {
+                    adaptive: false,
+                    ..PromptLookupConfig::default()
+                },
+            ] {
+                let mut generator = PromptLookupGenerator::new(config);
+                let (tokens, _) = generator.generate(model, &prompt, 96, sampling);
+                assert_eq!(
+                    tokens, expected,
+                    "earliest={} seed {seed} {config:?}",
+                    model.earliest
+                );
+                let stats = generator.stats();
+                total.rounds += stats.rounds;
+                total.drafted_rounds += stats.drafted_rounds;
+                total.paused_rounds += stats.paused_rounds;
+                total.proposed_draft_tokens += stats.proposed_draft_tokens;
+                total.accepted_draft_tokens += stats.accepted_draft_tokens;
+            }
+        }
+    }
+    totals
+}
+
+/// Both acceptance regimes showed up: blocks that land and blocks that are
+/// trimmed, and governor pauses long enough for the loop to pipeline.
+fn assert_both_regimes(totals: &[PromptLookupStats; 2]) {
+    for stats in totals {
+        assert!(
+            stats.accepted_draft_tokens > 0,
+            "no proposal landed: {stats:?}"
+        );
+        assert!(
+            stats.proposed_draft_tokens > stats.accepted_draft_tokens,
+            "no proposal was rejected, so no trim was exercised: {stats:?}"
+        );
+    }
+    let missing = &totals[1];
+    assert!(
+        missing.paused_rounds > 0,
+        "the missing model never paused the governor: {missing:?}"
+    );
+}
+
+/// The rollback contract: after every verify round the caches must hold
+/// exactly the emitted tokens, so a cache-dependent target produces plain
+/// decoding's reply token for token, through accepted blocks, rejected tails,
+/// and the pipelined plain rounds between them.
+#[test]
+fn rollback_keeps_a_cache_dependent_target_identical_to_plain_decoding() {
+    let sampling = SamplingConfig::greedy();
+    let totals = induction_parity(&sampling, |model, prompt| {
+        let plain = crate::generate::CxxGenerator::new(1).generate(model, prompt, 96, &sampling);
+        assert_eq!(
+            plain,
+            sequential_reference(model, prompt, 96, &sampling),
+            "greedy plain decoding is the sequential reference"
+        );
+        plain
+    });
+    assert_both_regimes(&totals);
+}
+
+/// Same contract on the per-position sampler path: a repetition penalty
+/// reads the emitted history, so every verify position samples on its own
+/// through the incremental sampler state, and each must see every token
+/// emitted before it, including the ones accepted earlier in the same block.
+#[test]
+fn rollback_matches_plain_decoding_under_a_repetition_penalty() {
+    let sampling = SamplingConfig {
+        repetition_penalty: 1.3,
+        penalty_last_n: 3,
+        ..SamplingConfig::greedy()
+    };
+    assert!(sampling.needs_token_history());
+    let totals = induction_parity(&sampling, |model, prompt| {
+        sequential_reference(model, prompt, 96, &sampling)
+    });
+    assert_both_regimes(&totals);
+}
+
+/// A dense-cache target that nonetheless owns its sequence state, the shape
+/// Gemma 4 and Llama 4 have: it batches and accepts padded prefill, so only
+/// the layout says the external caches are placeholders.
+struct ModelOwnedStateModel;
+
+impl LanguageModel for ModelOwnedStateModel {
+    fn forward(
+        &self,
+        input_ids: &ffi::MlxArray,
+        caches: &mut [KVCache],
+        mask: Option<&ffi::MlxArray>,
+    ) -> UniquePtr<ffi::MlxArray> {
+        ConstantModel.forward(input_ids, caches, mask)
+    }
+
+    fn make_caches(&self) -> Vec<KVCache> {
+        Vec::new()
+    }
+
+    fn num_layers(&self) -> usize {
+        1
+    }
+
+    fn eos_token_ids(&self) -> Vec<i32> {
+        vec![7]
+    }
+
+    fn sequence_state_layout(&self) -> crate::cache::SequenceStateLayout {
+        crate::cache::SequenceStateLayout::model_owned(1)
+    }
+}
+
+#[test]
+fn model_owned_sequence_state_is_refused_even_when_other_flags_allow_it() {
+    let model = ModelOwnedStateModel;
+    assert!(model.supports_batching() && model.supports_padded_prefill());
+    let reason = prompt_lookup_unsupported_reason(&model).expect("must be refused");
+    assert!(reason.contains("internally"), "{reason}");
+    assert!(supports_prompt_lookup(&ConstantModel));
+}
+
+#[test]
+#[should_panic(expected = "trimmable external KV caches")]
+fn generate_refuses_a_model_without_external_caches() {
+    let mut generator = PromptLookupGenerator::new(PromptLookupConfig::default());
+    let _ = generator.generate(
+        &ModelOwnedStateModel,
+        &[1, 2, 3],
+        8,
+        &SamplingConfig::greedy(),
+    );
+}
+
+#[test]
+#[should_panic(expected = "mirostat or adaptive-p")]
+fn generate_refuses_a_sampler_with_feedback_state() {
+    let sampling = SamplingConfig {
+        mirostat: 2,
+        ..SamplingConfig::with_temperature(0.8)
+    };
+    let mut generator = PromptLookupGenerator::new(PromptLookupConfig::default());
+    let _ = generator.generate(&ConstantModel, &[1, 2, 3], 8, &sampling);
+}
+
+/// Records the width of every forward and keeps the tokens in its cache, so
+/// the warmup's trims are observable.
+struct WidthRecordingModel {
+    widths: std::cell::RefCell<Vec<i32>>,
+}
+
+impl LanguageModel for WidthRecordingModel {
+    fn forward(
+        &self,
+        input_ids: &ffi::MlxArray,
+        caches: &mut [KVCache],
+        _mask: Option<&ffi::MlxArray>,
+    ) -> UniquePtr<ffi::MlxArray> {
+        let seq_len = ffi::array_shape(input_ids)[1];
+        self.widths.borrow_mut().push(seq_len);
+        let kv = ffi::ones(&[1, 1, seq_len, 1], crate::dtype::FLOAT32);
+        caches[0].update(kv, ffi::ones(&[1, 1, seq_len, 1], crate::dtype::FLOAT32));
+        ConstantModel.forward(input_ids, &mut [], None)
+    }
+
+    fn make_caches(&self) -> Vec<KVCache> {
+        vec![KVCache::new()]
+    }
+
+    fn num_layers(&self) -> usize {
+        1
+    }
+
+    fn eos_token_ids(&self) -> Vec<i32> {
+        vec![7]
+    }
+}
+
+#[test]
+fn warmup_runs_every_verify_width_and_rolls_each_back() {
+    let model = WidthRecordingModel {
+        widths: std::cell::RefCell::new(Vec::new()),
+    };
+    let prompt = [1, 2, 3, 4, 5];
+    let mut generator = PromptLookupGenerator::new(cfg(3, 2, 4));
+    generator.warm_up_verify_widths(&model, &prompt);
+    assert_eq!(*model.widths.borrow(), vec![5, 2, 3, 4, 5]);
+    assert_eq!(generator.caches[0].offset, prompt.len() as i32);
+}
